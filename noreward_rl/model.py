@@ -2,7 +2,29 @@ from __future__ import print_function
 import numpy as np
 import tensorflow as tf
 import tensorflow.contrib.rnn as rnn
-from constants import constants
+constants = {
+'GAMMA': 0.99,  # discount factor for rewards
+'LAMBDA': 1.0,  # lambda of Generalized Advantage Estimation: https://arxiv.org/abs/1506.02438
+'ENTROPY_BETA': 0.01,  # entropy regurarlization constant.
+'ROLLOUT_MAXLEN': 20, # 20 represents the number of 'local steps': the number of timesteps
+                    # we run the policy before we update the parameters.
+                    # The larger local steps is, the lower is the variance in our policy gradients estimate
+                    # on the one hand;  but on the other hand, we get less frequent parameter updates, which
+                    # slows down learning.  In this code, we found that making local steps be much
+                    # smaller than 20 makes the algorithm more difficult to tune and to get to work.
+'GRAD_NORM_CLIP': 40.0,   # gradient norm clipping
+'REWARD_CLIP': 1.0,       # reward value clipping in [-x,x]
+'MAX_GLOBAL_STEPS': 100000000,  # total steps taken across all workers
+'LEARNING_RATE': 1e-4,  # learning rate for adam
+
+'PREDICTION_BETA': 0.01,  # weight of prediction bonus
+                          # set 0.5 for unsup=state
+'PREDICTION_LR_SCALE': 10.0,  # scale lr of predictor wrt to policy network
+                              # set 30-50 for unsup=state
+'FORWARD_LOSS_WT': 0.2,  # should be between [0,1]
+                          # predloss = ( (1-FORWARD_LOSS_WT) * inv_loss + FORWARD_LOSS_WT * forward_loss) * PREDICTION_LR_SCALE
+'POLICY_NO_BACKPROP_STEPS': 0,  # number of global steps after which we start backpropagating to policy
+}
 
 
 def normalized_columns_initializer(std=1.0):
@@ -234,13 +256,13 @@ class LSTMPolicy(object):
 
 
 class StateActionPredictor(object):
-    def __init__(self, ob_space, ac_space, designHead='universe'):
+    def __init__(self, ob_dim, ac_dim, sess, designHead='universe'):
         # input: s1,s2: : [None, h, w, ch] (usually ch=1 or 4)
-        # asample: 1-hot encoding of sampled action from policy: [None, ac_space]
-        input_shape = [None] + list(ob_space)
+        # asample: 1-hot encoding of sampled action from policy: [None, ac_dim]
+        input_shape = [None] + list(ob_dim)
         self.s1 = phi1 = tf.placeholder(tf.float32, input_shape)
         self.s2 = phi2 = tf.placeholder(tf.float32, input_shape)
-        self.asample = asample = tf.placeholder(tf.float32, [None, ac_space])
+        self.asample = asample = tf.placeholder(tf.float32, [None, ac_dim])
 
         # feature encoding: phi1, phi2: [None, LEN]
         size = 256
@@ -265,18 +287,17 @@ class StateActionPredictor(object):
             with tf.variable_scope(tf.get_variable_scope(), reuse=True):
                 phi2 = universeHead(phi2)
 
-        # inverse model: g(phi1,phi2) -> a_inv: [None, ac_space]
-        g = tf.concat(1,[phi1, phi2])
+        # inverse model: g(phi1,phi2) -> a_inv: [None, ac_dim]
+        g = tf.concat([phi1, phi2], axis=1)
         g = tf.nn.relu(linear(g, size, "g1", normalized_columns_initializer(0.01)))
-        aindex = tf.argmax(asample, axis=1)  # aindex: [batch_size,]
-        logits = linear(g, ac_space, "glast", normalized_columns_initializer(0.01))
-        self.invloss = tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
-                                        logits, aindex), name="invloss")
-        self.ainvprobs = tf.nn.softmax(logits, dim=-1)
+        logits = linear(g, ac_dim, "glast", normalized_columns_initializer(0.01))
+
+        #TODO: CHANGE THIS TO MSE LOSS
+        self.invloss = 0.5*tf.reduce_mean(tf.square(tf.subtract(logits, asample)), name="invloss")
 
         # forward model: f(phi1,asample) -> phi2
         # Note: no backprop to asample of policy: it is treated as fixed for predictor training
-        f = tf.concat(1, [phi1, asample])
+        f = tf.concat([phi1, asample], axis=1)
         f = tf.nn.relu(linear(f, size, "f1", normalized_columns_initializer(0.01)))
         f = linear(f, phi1.get_shape()[1].value, "flast", normalized_columns_initializer(0.01))
         self.forwardloss = 0.5 * tf.reduce_mean(tf.square(tf.subtract(f, phi2)), name='forwardloss')
@@ -287,30 +308,53 @@ class StateActionPredictor(object):
         # variable list
         self.var_list = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, tf.get_variable_scope().name)
 
-    def pred_act(self, s1, s2):
-        '''
-        returns action probability distribution predicted by inverse model
-            input: s1,s2: [h, w, ch]
-            output: ainvprobs: [ac_space]
-        '''
-        sess = tf.get_default_session()
-        return sess.run(self.ainvprobs, {self.s1: [s1], self.s2: [s2]})[0, :]
+        self.loss = (constants['PREDICTION_LR_SCALE'] * (self.invloss * (1-constants['FORWARD_LOSS_WT']) +
+                                                                    self.forwardloss * constants['FORWARD_LOSS_WT']))
+        batch_size = tf.to_float(tf.shape(self.s1)[0])
+        predgrads = tf.gradients(self.loss * batch_size,
+                                 self.var_list)
+
+        predgrads, _ = tf.clip_by_global_norm(predgrads, constants['GRAD_NORM_CLIP'])
+        pred_grads_and_vars = list(zip(predgrads, self.var_list))
+        opt = tf.train.AdamOptimizer(constants['LEARNING_RATE'])
+        self.train_op = opt.apply_gradients(pred_grads_and_vars)
+
+        self.sess = sess
 
     def pred_bonus(self, s1, s2, asample):
         '''
         returns bonus predicted by forward model
-            input: s1,s2: [h, w, ch], asample: [ac_space] 1-hot encoding
+            input: s1,s2: [h, w, ch], asample: [ac_dim] 1-hot encoding
             output: scalar bonus
         '''
-        sess = tf.get_default_session()
-        # error = sess.run([self.forwardloss, self.invloss],
-        #     {self.s1: [s1], self.s2: [s2], self.asample: [asample]})
-        # print('ErrorF: ', error[0], ' ErrorI:', error[1])
-        error = sess.run(self.forwardloss,
-            {self.s1: [s1], self.s2: [s2], self.asample: [asample]})
+        error = self.sess.run(self.forwardloss,
+            {self.s1: s1, self.s2: s2, self.asample: asample})
         error = error * constants['PREDICTION_BETA']
         return error
 
+    def train(self, states, next_states, actions, batch_size=20, num_iters=100):
+        '''
+        How many iterations to train for per train call?
+        how/what to initialize the variables to?
+        :param states:
+        :param next_states:
+        :param actions:
+        :param batch_size:
+        :return:
+        '''
+        total_loss = 0
+        for i in range(num_iters):
+            states_batch = states[np.random.randint(0, states.shape[0], batch_size)]
+            next_states_batch = next_states[np.random.randint(0, next_states.shape[0], batch_size)]
+            actions_batch = actions[np.random.randint(0, actions.shape[0], batch_size)]
+            feed_dict = {
+                self.s1:states_batch,
+                self.s2: next_states_batch,
+                self.asample: actions_batch,
+            }
+            loss, _ = self.sess.run((self.loss, self.train_op), feed_dict)
+            total_loss+=loss
+        print('Average Curiosity Loss', total_loss/num_iters)
 
 class StatePredictor(object):
     '''
