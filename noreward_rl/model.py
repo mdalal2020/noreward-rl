@@ -2,6 +2,7 @@ from __future__ import print_function
 import numpy as np
 import tensorflow as tf
 import tensorflow.contrib.rnn as rnn
+from railrl.core.logging import logger
 constants = {
 'GAMMA': 0.99,  # discount factor for rewards
 'LAMBDA': 1.0,  # lambda of Generalized Advantage Estimation: https://arxiv.org/abs/1506.02438
@@ -332,10 +333,9 @@ class StateActionPredictor(object):
         error = error * constants['PREDICTION_BETA']
         return error
 
-    def train(self, states, next_states, actions, batch_size=20, num_iters=100):
+    def train(self, states, next_states, actions, batch_size=20, batches=100):
         '''
         How many iterations to train for per train call?
-        how/what to initialize the variables to?
         :param states:
         :param next_states:
         :param actions:
@@ -343,7 +343,7 @@ class StateActionPredictor(object):
         :return:
         '''
         total_loss = 0
-        for i in range(num_iters):
+        for i in range(batches):
             states_batch = states[np.random.randint(0, states.shape[0], batch_size)]
             next_states_batch = next_states[np.random.randint(0, next_states.shape[0], batch_size)]
             actions_batch = actions[np.random.randint(0, actions.shape[0], batch_size)]
@@ -354,7 +354,7 @@ class StateActionPredictor(object):
             }
             loss, _ = self.sess.run((self.loss, self.train_op), feed_dict)
             total_loss+=loss
-        print('Average Curiosity Loss', total_loss/num_iters)
+        logger.record_tabular('Average Curiosity Loss', total_loss/batches)
 
 class StatePredictor(object):
     '''
