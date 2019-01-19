@@ -354,7 +354,7 @@ class StateActionPredictor(object):
             }
             loss, _ = self.sess.run((self.loss, self.train_op), feed_dict)
             total_loss+=loss
-        logger.record_tabular('Average Curiosity Loss', total_loss/batches)
+        return total_loss/batches
 
 class StatePredictor(object):
     '''
